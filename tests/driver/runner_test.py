@@ -6812,6 +6812,33 @@ class TestGetAsyncSearch:
 
         es.async_search.get.assert_awaited_once_with(id="12345", params={})
 
+    @pytest.mark.asyncio
+    async def test_get_async_search_without_a_search_id(self):
+        # We only need the request context holder functionality but not any calls to Elasticsearch.
+        es = client.RequestContextHolder()
+        es.async_search = mock.Mock()
+        es.async_search.get = mock.AsyncMock()
+
+        r = runner.GetAsyncSearch()
+        params = {"retrieve-results-for": "search-1"}
+
+        async with runner.CompositeContext():
+            # the submit did not return an id, e.g. because the search completed before the submit returned
+            runner.CompositeContext.put("search-1", None)
+            with es.new_request_context() as request_context:
+                response = await r(es, params)
+            assert response == {
+                "weight": 0,
+                "unit": "ops",
+                "success": True,
+                "stats": {},
+            }
+            # the runner issued no request but still has to provide a timing, see #1837
+            assert request_context.request_start is not None
+            assert request_context.request_end is not None
+
+        es.async_search.get.assert_not_awaited()
+
 
 class TestDeleteAsyncSearch:
     @mock.patch("elasticsearch.Elasticsearch")
@@ -6833,6 +6860,26 @@ class TestDeleteAsyncSearch:
                 mock.call(id="6789"),
             ]
         )
+
+    @pytest.mark.asyncio
+    async def test_delete_async_search_without_a_search_id(self):
+        # We only need the request context holder functionality but not any calls to Elasticsearch.
+        es = client.RequestContextHolder()
+        es.async_search = mock.Mock()
+        es.async_search.delete = mock.AsyncMock()
+
+        r = runner.DeleteAsyncSearch()
+        params = {"delete-results-for": ["search-1"]}
+
+        async with runner.CompositeContext():
+            runner.CompositeContext.put("search-1", None)
+            with es.new_request_context() as request_context:
+                await r(es, params)
+            # the runner issued no request but still has to provide a timing, see #1837
+            assert request_context.request_start is not None
+            assert request_context.request_end is not None
+
+        es.async_search.delete.assert_not_awaited()
 
 
 class TestOpenPointInTime:
@@ -7947,6 +7994,59 @@ class TestComposite:
             assert timing["dependent_timing"]["request_start"] == start
             assert timing["dependent_timing"]["request_end"] == end
             assert timing["dependent_timing"]["request_end"] > timing["dependent_timing"]["request_start"]
+
+    @pytest.mark.asyncio
+    async def test_adds_request_timings_for_operations_without_request(self):
+        # See #1837: a submit that does not return a search id leaves the retrieve and the delete
+        # with nothing to do, so neither of them issues a request.
+        es = client.RequestContextHolder()
+
+        async def submit(*args, **kwargs):
+            # a real request stamps the request context
+            es.on_request_start()
+            es.on_request_end()
+            # the search completed before `wait_for_completion_timeout` elapsed and its results were not kept
+            return {}
+
+        es.async_search = mock.Mock()
+        es.async_search.submit = submit
+        es.async_search.get = mock.AsyncMock()
+        es.async_search.delete = mock.AsyncMock()
+
+        params = {
+            "requests": [
+                {
+                    "name": "search-1",
+                    "operation-type": "submit-async-search",
+                    "body": {"query": {"match_all": {}}},
+                    "index": "_all",
+                },
+                {
+                    "name": "get-1",
+                    "operation-type": "get-async-search",
+                    "retrieve-results-for": "search-1",
+                },
+                {
+                    "name": "delete-1",
+                    "operation-type": "delete-async-search",
+                    "delete-results-for": "search-1",
+                },
+            ]
+        }
+
+        r = runner.Composite()
+        response = await r(es, params)
+
+        timings = response["dependent_timing"]
+        assert [t["dependent_timing"]["operation"] for t in timings] == ["search-1", "get-1", "delete-1"]
+        for timing in timings:
+            dependent_timing = timing["dependent_timing"]
+            assert dependent_timing["request_start"] is not None
+            assert dependent_timing["request_end"] is not None
+            assert dependent_timing["service_time"] >= 0
+
+        es.async_search.get.assert_not_awaited()
+        es.async_search.delete.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_executes_nested_composite_with_shared_context(self):

@@ -2933,13 +2933,28 @@ def async_search_ids(op_names):
             yield subject_id, subject
 
 
+def _mark_no_request_issued(es):
+    """
+    Stamps the current request context for a runner that returned without issuing a single request.
+
+    Timing arithmetic subtracts the request start from the request end, both in ``RequestTiming`` for operations
+    nested in a composite and in the driver for regular tasks. A runner that skips all of its requests therefore
+    has to stamp the context, otherwise both timestamps stay unset. The resulting service time is close to zero,
+    which matches the amount of work that has been done.
+    """
+    es.on_request_start()
+    es.on_request_end()
+
+
 class GetAsyncSearch(Runner):
     async def __call__(self, es, params):
         success = True
         searches = mandatory(params, "retrieve-results-for", self)
         request_params = params.get("request-params", {})
         stats = {}
+        issued_request = False
         for search_id, search in async_search_ids(searches):
+            issued_request = True
             response = await es.async_search.get(id=search_id, params=request_params)
             is_running = response["is_running"]
             success = success and not is_running
@@ -2952,6 +2967,10 @@ class GetAsyncSearch(Runner):
                 if "total" in response["response"]["hits"].keys():
                     stats[search]["hits"] = response["response"]["hits"]["total"]["value"]
                     stats[search]["hits_relation"] = response["response"]["hits"]["total"]["relation"]
+
+        if not issued_request:
+            # none of the searches has been submitted successfully, so there is nothing to retrieve
+            _mark_no_request_issued(es)
 
         return {
             # only count completed searches - there is one key per search id in `stats`
@@ -2968,9 +2987,15 @@ class GetAsyncSearch(Runner):
 class DeleteAsyncSearch(Runner):
     async def __call__(self, es, params):
         searches = mandatory(params, "delete-results-for", self)
+        issued_request = False
         for search_id, search in async_search_ids(searches):
+            issued_request = True
             await es.async_search.delete(id=search_id)
             CompositeContext.remove(search)
+
+        if not issued_request:
+            # none of the searches has been submitted successfully, so there is nothing to delete
+            _mark_no_request_issued(es)
 
     def __repr__(self, *args, **kwargs):
         return "delete-async-search"
