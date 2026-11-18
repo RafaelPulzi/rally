@@ -4263,6 +4263,32 @@ class TestGlobalStats:
         assert "source-revision" not in race.result_doc_base()
         assert all("source-revision" not in doc for doc in race.to_result_dicts())
 
+    @pytest.mark.parametrize("flavor", ["oss", "serverless", "default"])
+    def test_result_docs_omit_build_flavor_as_source_revision(self, flavor):
+        # a cluster that does not report a build hash makes the driver fall back to the build flavor
+        race = metrics.Race(
+            "1.0.0",
+            None,
+            "unittest",
+            "race-1",
+            datetime.datetime(2016, 1, 31, tzinfo=datetime.timezone.utc),
+            "benchmark-only",
+            {},
+            Track(name="test"),
+            {},
+            Challenge(name="default", schedule=[]),
+            "defaults",
+            {},
+            {},
+            distribution_flavor=flavor,
+            distribution_version="8.6.0",
+            revision=flavor,
+        )
+        race.add_results(metrics.GlobalStats({"young_gc_time": 100}))
+
+        assert "source-revision" not in race.result_doc_base()
+        assert all("source-revision" not in doc for doc in race.to_result_dicts())
+
 
 class TestSystemStats:
     def test_as_flat_list(self):
